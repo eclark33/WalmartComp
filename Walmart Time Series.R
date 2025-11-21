@@ -45,14 +45,13 @@ feature_recipe <- recipe(~., data=features) %>%
 
 imputed_features <- juice(prep(feature_recipe))
 
-
-
 # join
 train_data <- train_data %>%
   left_join(features, by = c("Store", "Date"))
 
-
-
+## JOIN WITH TEST DATA ##
+testData <- testData %>%
+  left_join(features, by = c("Store", "Date"))
 
 
 ############################# EDA ###############################
@@ -315,8 +314,43 @@ show_best(CV_results, metric = "mae", n = 1)
 
 
 
+######################### PROPHET MODEL #########################
 
 
+# Store and Dept
+store <- 1 # I did 17
+dept <- 20 # I used 17
+  
+# filter and Rename to match prophet syntax
+sd_train <- train_data %>%
+  filter(Store == store, Dept == dept) %>%
+  rename(y = Weekly_Sales, ds = Date)
+
+sd_test <- joined_Test %>%
+  filter(Store == store, Dept == dept) %>%
+  rename(ds = Date)
+
+# fit prophet model
+prophet_model <- prophet() %>%
+  add_regressor("x1") %>%
+  add_regressor("x2") %>%
+  add_regressor("x3") %>%
+  fit.prophet(df=sd_train)
+
+
+## Predict Using Fitted prophet Model
+
+fitted_vals <- predict(prophet_model, df=sd_train) 
+
+#For Plotting Fitted Values
+test_preds <- predict(prophet_model, df=sd_test) #Predictions are called "yhat"
+
+## Plot Fitted and Forecast on Same Plot
+ggplot() + 
+  geom_line(data = sd_train, mapping = aes(x = ds, y = y, color = "Data")) +
+  geom_line(data = fitted_vals, mapping = aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+  geom_line(data = test_preds, mapping = aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+  scale_color_manual(values = c("Data" = "black", "Fitted" = "blue", "Forecast" = "red")) 
 
 
 # 4322
@@ -335,25 +369,5 @@ show_best(CV_results, metric = "mae", n = 1)
 # feature engineer the heck out of the Date variable (month, week specific holiday, numerical date)
 # small sample size -> use simple model, predict 0s
 
-
-
-# dr heaton's code 
-### Impute Missing Markdowns
-features <- features %>%
-  mutate(across(starts_with("MarkDown"), ~ replace_na(., 0))) %>%
-  mutate(across(starts_with("MarkDown"), ~ pmax(., 0))) %>%
-  mutate(
-    MarkDown_Total = rowSums(across(starts_with("MarkDown")), na.rm = TRUE),
-    MarkDown_Flag = if_else(MarkDown_Total > 0, 1, 0),
-    MarkDown_Log   = log1p(MarkDown_Total)
-  ) %>%
-  select(-MarkDown1, -MarkDown2, -MarkDown3, -MarkDown4, -MarkDown5)
-
-## Impute Missing CPI and Unemployment
-feature_recipe <- recipe(~., data=features) %>%
-  step_mutate(DecDate = decimal_date(Date)) %>%
-  step_impute_bag(CPI, Unemployment,
-                  impute_with = imp_vars(DecDate, Store))
-imputed_features <- juice(prep(feature_recipe))
 
 
