@@ -2,6 +2,7 @@
 library(tidyverse)
 library(tidymodels)
 library(vroom)
+library(prophet)
 
 
 
@@ -47,11 +48,15 @@ imputed_features <- juice(prep(feature_recipe))
 
 # join
 train_data <- train_data %>%
-  left_join(features, by = c("Store", "Date"))
+  left_join(imputed_features, by = c("Store", "Date"))
 
 ## JOIN WITH TEST DATA ##
+# create day of week variable
 testData <- testData %>%
-  left_join(features, by = c("Store", "Date"))
+  mutate(date_doy = yday(Date))
+
+testData <- testData %>%
+  left_join(imputed_features, by = c("Store", "Date"))
 
 
 ############################# EDA ###############################
@@ -83,16 +88,115 @@ train_data %>%
   geom_smooth(se = FALSE)
 
 
-
-
-
-
-
-
-
-
-
 ################################# MODELING #######################################
+
+all_preds <- tibble(Id = character(), Weekly_Sales = numeric())
+
+# Get all unique store–dept combos in test set
+combos <- testData %>% distinct(Store, Dept)
+
+for(i in seq_len(nrow(combos))) {
+  
+  store <- combos$Store[i]
+  dept  <- combos$Dept[i]
+  
+  # Filter train/test for this combo
+  dept_train <- train_data %>% filter(Store == store, Dept == dept)
+  dept_test  <- testData  %>% filter(Store == store, Dept == dept)
+  
+  # Handle edge cases
+  if(nrow(dept_train) == 0) {
+    preds <- dept_test %>%
+      transmute(Id = paste(Store, Dept, Date, sep = "_"),
+                Weekly_Sales = 0)
+    
+  } else if(nrow(dept_train) < 10) {
+    preds <- dept_test %>%
+      transmute(Id = paste(Store, Dept, Date, sep = "_"),
+                Weekly_Sales = mean(dept_train$Weekly_Sales))
+    
+  } else {
+    # Recipe
+    my_recipe <- recipe(Weekly_Sales ~ ., data = dept_train) %>%
+      step_range(date_doy, min = 0, max = pi) %>%
+      step_mutate(sinDOY = sin(date_doy), cosDOY = cos(date_doy)) %>%
+      step_date(Date, features = c("month","year")) %>%
+      step_rm(any_of(c("Date", "Store", "Dept", "IsHoliday", "IsHoliday.x", "IsHoliday.y")))
+    
+    
+    # Model
+    forest_mod <- rand_forest(mtry = tune(),
+                              min_n = tune(),
+                              trees = 100) %>%
+      set_engine("ranger") %>%
+      set_mode("regression")
+    
+    wf <- workflow() %>%
+      add_recipe(my_recipe) %>%
+      add_model(forest_mod)
+    
+    # CV folds (time‑series CV would be even better)
+    folds <- vfold_cv(dept_train, v = 3)
+    
+    grid <- grid_regular(mtry(range = c(1,10)),
+                         min_n(),
+                         levels = 5)
+    
+    tuned <- tune_grid(
+      wf,
+      resamples = folds,
+      grid = grid,
+      metrics = metric_set(mae)
+    )
+    
+    bestTune <- tuned %>% select_best(metric = "mae")
+    
+    final_wf <- wf %>%
+      finalize_workflow(bestTune) %>%
+      fit(data = dept_train)
+    
+    preds <- dept_test %>%
+      transmute(Id = paste(Store, Dept, Date, sep = "_"),
+                Weekly_Sales = predict(final_wf, new_data = .) %>% pull(.pred))
+  }
+  
+  # Bind predictions
+  all_preds <- bind_rows(all_preds, preds)
+  
+  cat("Store", store, "Dept", dept, "done.\n")
+}
+
+# Save predictions
+vroom::vroom_write(all_preds, "Walmart_RF_Preds.csv", delim = ",")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # recipe
 walmart_recipe <- recipe(Weekly_Sales ~ ., data = train_data) %>%
@@ -151,7 +255,6 @@ CV_results <- s1dept80_workflow %>%
             control = control_grid(verbose = TRUE))
 
 
-
 # find best tuning parameters
 bestTune <- CV_results %>%
   select_best(metric = "mae")
@@ -162,15 +265,9 @@ final_wf <- s1dept80_workflow %>%
   fit(data = s1dept80) 
 
 
-show_best(CV_results, metric = "mae", n = 1)
-
-CV_results %>% 
-  collect_metrics() %>% 
-  filter(.metric == "mae") %>% 
-  semi_join(bestTune, by = c("mtry", "min_n"))
-
-
-
+## predictions
+boost_preds <- final_wf %>%
+  predict(new_data = testData)
 
 
 
@@ -318,56 +415,62 @@ show_best(CV_results, metric = "mae", n = 1)
 
 
 # Store and Dept
-store <- 1 # I did 17
-dept <- 20 # I used 17
+store <- 4 # I did 17
+dept <- 34 # I used 17
   
 # filter and Rename to match prophet syntax
 sd_train <- train_data %>%
   filter(Store == store, Dept == dept) %>%
   rename(y = Weekly_Sales, ds = Date)
 
-sd_test <- joined_Test %>%
+sd_test <- testData %>%
   filter(Store == store, Dept == dept) %>%
   rename(ds = Date)
 
+
+sd_test <- sd_test %>%
+  fill(CPI, .direction = "downup")
+sd_train <- sd_train %>%
+  fill(Unemployment, .direction = "downup")
+sd_test <- sd_test %>%
+  fill(Unemployment, .direction = "downup")
+
+
 # fit prophet model
 prophet_model <- prophet() %>%
-  add_regressor("x1") %>%
-  add_regressor("x2") %>%
-  add_regressor("x3") %>%
-  fit.prophet(df=sd_train)
+  add_regressor("date_doy") %>%
+  add_regressor("Fuel_Price") %>%
+  add_regressor("CPI") %>%
+  add_regressor("Unemployment") %>%
+  add_regressor("TotalMarkdown") %>%
+  fit.prophet(df = sd_train)
 
 
 ## Predict Using Fitted prophet Model
-
-fitted_vals <- predict(prophet_model, df=sd_train) 
+fitted_vals <- predict(prophet_model, df = sd_train) 
 
 #For Plotting Fitted Values
-test_preds <- predict(prophet_model, df=sd_test) #Predictions are called "yhat"
+test_preds <- predict(prophet_model, df = sd_test) #Predictions are called "yhat"
 
 ## Plot Fitted and Forecast on Same Plot
-ggplot() + 
+plot_uno <- ggplot() + 
   geom_line(data = sd_train, mapping = aes(x = ds, y = y, color = "Data")) +
   geom_line(data = fitted_vals, mapping = aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
   geom_line(data = test_preds, mapping = aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
-  scale_color_manual(values = c("Data" = "black", "Fitted" = "blue", "Forecast" = "red")) 
+  scale_color_manual(values = c("Data" = "black", "Fitted" = "blue", "Forecast" = "red")) + 
+  labs(color = "")
+
+plot_dos <- ggplot() + 
+  geom_line(data = sd_train, mapping = aes(x = ds, y = y, color = "Data")) +
+  geom_line(data = fitted_vals, mapping = aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+  geom_line(data = test_preds, mapping = aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+  scale_color_manual(values = c("Data" = "black", "Fitted" = "blue", "Forecast" = "red")) + 
+  labs(color = "")
 
 
-# 4322
 
+library(patchwork)
 
-
-
-
-
-
-
-# have different time series for each store-dept combination 
-
-# ISSUES & HOW TO RESOLVE
-# missing values -> imputation (put it in yourself), make missing values 0s
-# feature engineer the heck out of the Date variable (month, week specific holiday, numerical date)
-# small sample size -> use simple model, predict 0s
-
-
+combined_plot <- plot_uno / plot_dos   
+combined_plot
 
